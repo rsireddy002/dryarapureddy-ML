@@ -31,24 +31,24 @@ instead of 230 HTTP round-trips.
 pip install -r requirements.txt
 $env:UPSTOX_ACCESS_TOKEN = "your_token_here"
 python instrument_resolver.py     # one-time: resolves & caches instrument keys
-```
-
-**Before running feed_listener.py**, you MUST create `proto_decoder.py`
-with your real protobuf decode logic, copied over from
-`upstox-feed-listener` (which already has this working, including the
-int64-as-string fix). See `proto_decoder.py`'s docstring for the exact
-function signature required. This repo intentionally does NOT ship a
-guessed/reimplemented protobuf schema -- that risk isn't worth it for
-data a live trading tool depends on.
-
-Once `proto_decoder.py` is filled in:
-
-```
 python feed_listener.py
 ```
 
 Leave it running in its own terminal/window during market hours. It
 reconnects automatically on disconnect.
+
+**Tiering:** if `tier1_keys.txt`/`tier2_keys.txt` (the same format your
+`build_tier1_keys.py` already produces) are present in this folder,
+`feed_listener.py` uses them directly -- keeping this repo's tiering in
+sync with whatever fixed anchors/RVOL ranking you've set up there.
+Otherwise it falls back to auto-splitting by the `TIER1_SYMBOLS` constant
+(currently just NIFTY/BANKNIFTY).
+
+`proto_decoder.py` and `MarketDataFeedV3_pb2.py` are built directly from
+your actual Upstox V3 protobuf schema (not a re-guessed one) and were
+tested end-to-end against real serialized protobuf messages covering all
+three feed variants (marketFF for equities/futures, indexFF for indices,
+plain ltpc) -- see the commit that added them for the test.
 
 ## Files
 
@@ -61,8 +61,11 @@ reconnects automatically on disconnect.
 - `feed_listener.py` -- WebSocket connection, subscription, reconnect
   logic, and the periodic JSON dump. Imports `decode_feed_message` from
   `proto_decoder.py`.
-- `proto_decoder.py` -- **you fill this in** using your existing working
-  decoder from `upstox-feed-listener`.
+- `proto_decoder.py` -- decodes protobuf messages into per-instrument
+  ticks. Built from your real `MarketDataFeedV3.proto` schema, tested
+  against real serialized messages (see commit history).
+- `MarketDataFeedV3_pb2.py` -- your compiled protobuf module, copied in
+  unchanged.
 
 ## Output format
 

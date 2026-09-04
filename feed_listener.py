@@ -4,24 +4,18 @@ subscribes to the full F&O universe in tiers (same tiered pattern as
 upstox-feed-listener: Tier 1 gets full_d30 depth, Tier 2 gets full),
 feeds every tick into CandleAggregator, and periodically dumps all
 symbols' rolling 5-min candles to a shared JSON file that
-fno-liquid-scanner-live's Streamlit app reads instead of hitting the
+fno-liquid-scanner-live's Streamlit app can read instead of hitting the
 REST historical-candle endpoint ~230 times per refresh.
 
-*** IMPORTANT -- READ BEFORE RUNNING ***
-Upstox's WebSocket feed sends protobuf-encoded binary frames. You
-ALREADY have a working, tested decoder for this in upstox-feed-listener
-(including the fix for int64 fields being serialized as strings). Rather
-than re-guess that .proto schema here and risk silently wrong data, this
-script imports a `decode_feed_message` function from proto_decoder.py --
-a file YOU need to create in this repo by copying the relevant decode
-logic over from upstox-feed-listener. See proto_decoder.py's docstring
-for the exact function signature expected.
+Decoding is handled by proto_decoder.py, built directly from your actual
+MarketDataFeedV3.proto schema and tested end-to-end against real
+serialized protobuf messages (marketFF, indexFF, and plain ltpc cases) --
+see this repo's commit history for the test.
 
 SETUP:
     pip install -r requirements.txt
     $env:UPSTOX_ACCESS_TOKEN = "your_token_here"
     python instrument_resolver.py     # one-time: builds instrument_keys_cache.json
-    # create proto_decoder.py (see its docstring) before running this
     python feed_listener.py
 
 OUTPUT:
@@ -40,19 +34,16 @@ import websocket  # pip install websocket-client
 
 from candle_aggregator import CandleAggregator
 from instrument_resolver import resolve_all, get_token
-
-try:
-    from proto_decoder import decode_feed_message
-except ImportError:
-    raise SystemExit(
-        "\nproto_decoder.py not found. This repo needs YOUR existing protobuf "
-        "decode logic from upstox-feed-listener -- see feed_listener.py's "
-        "docstring and proto_decoder.py's docstring for what to copy over.\n"
-    )
+from proto_decoder import decode_feed_message
 
 IST = timezone(timedelta(hours=5, minutes=30))
 AUTHORIZE_URL = "https://api.upstox.com/v3/feed/market-data-feed/authorize"
-OUTPUT_PATH = "fno_live_candles.json"
+OUTPUT_PATH = os.environ.get("FNO_LIVE_CANDLES_OUTPUT", "fno_live_candles.json")
+# ^ override to write directly into fno-liquid-scanner-live's folder, e.g.:
+#   $env:FNO_LIVE_CANDLES_OUTPUT = "C:\Users\MY-PC\Desktop\fno-liquid-scanner-live\fno_live_candles.json"
+# so that repo can read it without any copy step, while keeping both repos
+# independent (this one has no dependency on the other's folder structure
+# beyond this one optional env var).
 DUMP_INTERVAL_SECONDS = 5
 
 # Same tiering idea as upstox-feed-listener: a small "Tier 1" set gets
@@ -149,6 +140,21 @@ def on_open(ws, tier1_keys, tier2_keys):
     print("Subscription messages sent.")
 
 
+TIER1_KEYS_FILE = "tier1_keys.txt"
+TIER2_KEYS_FILE = "tier2_keys.txt"
+
+
+def load_keys_file(path):
+    """Reads a comma-separated instrument-key list, same format your
+    build_tier1_keys.py already writes. Returns [] if the file doesn't
+    exist -- caller falls back to auto-splitting via TIER1_SYMBOLS."""
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+    return [k.strip() for k in content.split(",") if k.strip()]
+
+
 def run():
     global symbol_by_key
     token = get_token()
@@ -157,8 +163,32 @@ def run():
     key_by_symbol = resolve_all(token)
     symbol_by_key = {v: k for k, v in key_by_symbol.items()}
 
-    tier1_keys = [key_by_symbol[s] for s in TIER1_SYMBOLS if s in key_by_symbol]
-    tier2_keys = [key_by_symbol[s] for s in key_by_symbol if s not in TIER1_SYMBOLS]
+    # Prefer your own pre-built tier1_keys.txt/tier2_keys.txt (from
+    # build_tier1_keys.py) if present -- keeps this repo's tiering in
+    # sync with whatever fixed anchors/RVOL ranking you've already set up,
+    # rather than falling back to the simple TIER1_SYMBOLS constant here.
+    tier1_keys = load_keys_file(TIER1_KEYS_FILE)
+    tier2_keys = load_keys_file(TIER2_KEYS_FILE)
+
+    if tier1_keys or tier2_keys:
+        print(f"Using {TIER1_KEYS_FILE} ({len(tier1_keys)} keys) and "
+              f"{TIER2_KEYS_FILE} ({len(tier2_keys)} keys).")
+        # symbol_by_key only knows about EQUITY_SYMBOLS/FUTURES_SYMBOLS from
+        # instrument_resolver.py -- keys from tier1/tier2 files not found
+        # there (e.g. NSE_INDEX|... index keys, which aren't equities or
+        # futures) won't map to a symbol name and so won't be aggregated
+        # into named candles, but they'll still be subscribed/received.
+        unmapped = [k for k in tier1_keys + tier2_keys if k not in symbol_by_key]
+        if unmapped:
+            print(f"  Note: {len(unmapped)} key(s) from these files have no symbol "
+                  f"name in instrument_keys_cache.json (e.g. raw index keys) -- "
+                  f"they'll be subscribed but won't appear in fno_live_candles.json "
+                  f"under a friendly symbol name.")
+    else:
+        print(f"No {TIER1_KEYS_FILE}/{TIER2_KEYS_FILE} found -- auto-splitting "
+              f"by TIER1_SYMBOLS instead.")
+        tier1_keys = [key_by_symbol[s] for s in TIER1_SYMBOLS if s in key_by_symbol]
+        tier2_keys = [key_by_symbol[s] for s in key_by_symbol if s not in TIER1_SYMBOLS]
 
     dump_thread = threading.Thread(target=dump_loop, daemon=True)
     dump_thread.start()
