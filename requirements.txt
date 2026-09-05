@@ -1,3 +1,8 @@
+streamlit
 requests
+pandas
+numpy
+plotly
+streamlit-autorefresh
 websocket-client
 protobuf
