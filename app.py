@@ -361,6 +361,72 @@ def fetch_candles(instrument_key, token, unit, interval, lookback_days):
     return df
 
 
+def fetch_5min_candles_ending(instrument_key, token, end_date, total_days):
+    """Same as fetch_candles(unit='minutes', interval='5', ...) but anchored
+    to an arbitrary past end_date instead of 'now' -- needed for the Replay
+    tab, which looks at historical sessions, not today.
+
+    Chunks into <=20-day windows and concatenates: Upstox's 5-min
+    historical-candle endpoint rejects overly wide date ranges in one call
+    (a 400 for ~30+ days -- same limit discovered and worked around in
+    backtest_zone_formation.py)."""
+    all_chunks = []
+    remaining = total_days
+    cursor_end = end_date
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+
+    while remaining > 0:
+        chunk_days = min(20, remaining)
+        chunk_start = cursor_end - timedelta(days=chunk_days)
+        url = (f"https://api.upstox.com/v3/historical-candle/{instrument_key}/minutes/5/"
+               f"{cursor_end.strftime('%Y-%m-%d')}/{chunk_start.strftime('%Y-%m-%d')}")
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        candles = resp.json().get("data", {}).get("candles", [])
+        if candles:
+            all_chunks.append(pd.DataFrame(
+                candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"]
+            ))
+        cursor_end = chunk_start
+        remaining -= chunk_days
+
+    if not all_chunks:
+        return pd.DataFrame()
+
+    df = pd.concat(all_chunks, ignore_index=True)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.drop_duplicates(subset="timestamp").sort_values("timestamp").reset_index(drop=True)
+    df["date"] = df["timestamp"].dt.date
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_replay_data(instrument_key, token, replay_date_str):
+    """Cached per (symbol, date) -- the Replay tab's slider re-runs this
+    function's CALLER on every drag, but the actual fetch only happens
+    once per symbol/date pick, not once per slider position. Returns
+    (composite_zones, day_df) or (None, None) if there's not enough
+    history or no candles for that day."""
+    replay_date = datetime.strptime(replay_date_str, "%Y-%m-%d").date()
+    total_days = COMPOSITE_LOOKBACK_DAYS + 25  # buffer for weekends/holidays
+    full_df = fetch_5min_candles_ending(instrument_key, token, replay_date, total_days)
+    if full_df.empty:
+        return None, None
+
+    trading_days = sorted(full_df["date"].unique())
+    if replay_date not in trading_days:
+        return None, None
+    day_idx = trading_days.index(replay_date)
+    composite_days = trading_days[max(0, day_idx - COMPOSITE_LOOKBACK_DAYS):day_idx]
+    if not composite_days:
+        return None, None
+
+    composite_df = full_df[full_df["date"].isin(composite_days)]
+    composite_zones = compute_composite_zones(composite_df)
+    day_df = full_df[full_df["date"] == replay_date].reset_index(drop=True)
+    return composite_zones, day_df
+
+
 def compute_composite_zones(intraday_df):
     """Composite zone set from the FULL multi-day intraday_df (no date
     filtering -- composite means across all fetched days)."""
@@ -976,8 +1042,8 @@ if os.path.exists(CACHE_PATH):
 
     st.divider()
 
-    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_setups, tab_alerts = st.tabs(
-        ["Scanner", "Key Levels", "Chart", "Sectors", "Setups", "Alerts"]
+    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_setups, tab_replay, tab_alerts = st.tabs(
+        ["Scanner", "Key Levels", "Chart", "Sectors", "Setups", "Replay", "Alerts"]
     )
 
     with tab_scanner:
@@ -1161,6 +1227,189 @@ if os.path.exists(CACHE_PATH):
             st.write("None this cycle.")
         else:
             st.dataframe(top_df, use_container_width=True, hide_index=True)
+
+    with tab_replay:
+        st.caption(
+            "Pick a past trading day and scrub (or press Play) to watch candles, intraday "
+            "zones, and validated zones form exactly as they would have appeared live -- "
+            "same logic as backtest_zone_formation.py, but visual instead of console output."
+        )
+        if not symbols_with_zones:
+            st.write("No zones available yet - click 'Run Precompute'.")
+        else:
+            replay_mode = st.radio(
+                "Mode", ["Single symbol", "Whole sector together"],
+                horizontal=True, key="replay_mode",
+            )
+            replay_date = st.date_input(
+                "Trading day", value=now_ist().date() - timedelta(days=1),
+                max_value=now_ist().date() - timedelta(days=1), key="replay_date",
+            )
+            token = get_token()
+
+            if replay_mode == "Single symbol":
+                replay_symbol = st.selectbox("Symbol", symbols_with_zones, index=default_idx, key="replay_symbol")
+                c = cache[replay_symbol]
+
+                composite_zones, day_df = fetch_replay_data(
+                    c["instrument_key"], token, replay_date.strftime("%Y-%m-%d")
+                )
+
+                if day_df is None or day_df.empty:
+                    st.write("No candle data for that day (market holiday, weekend, or not enough "
+                             "prior history for a composite window). Try a different date.")
+                else:
+                    n_candles = len(day_df)
+
+                    # Reset playback when symbol/date changes; clamp a
+                    # stale slider value from a previous day's different
+                    # candle count.
+                    selection_id = f"single_{replay_symbol}_{replay_date}"
+                    if st.session_state.get("replay_selection_id") != selection_id:
+                        st.session_state["replay_selection_id"] = selection_id
+                        st.session_state["replay_slider"] = 1
+                        st.session_state["replay_playing"] = False
+                    elif st.session_state.get("replay_slider", 1) > n_candles:
+                        st.session_state["replay_slider"] = n_candles
+
+                    play_col, restart_col, speed_col = st.columns([1, 1, 2])
+                    with play_col:
+                        playing = st.checkbox("Play", key="replay_playing")
+                    with restart_col:
+                        if st.button("Restart", key="replay_restart_single"):
+                            st.session_state["replay_slider"] = 1
+                    with speed_col:
+                        speed_ms = st.select_slider(
+                            "Speed", options=[1000, 600, 300, 150], value=600,
+                            format_func=lambda v: f"{1000 / v:.1f}x", key="replay_speed",
+                        )
+
+                    if playing:
+                        st_autorefresh(interval=speed_ms, key="replay_autoplay_tick")
+                        if st.session_state["replay_slider"] < n_candles:
+                            st.session_state["replay_slider"] += 1
+                        else:
+                            st.session_state["replay_playing"] = False
+
+                    slider_pos = st.slider(
+                        "Candles shown (scrub through the session)",
+                        min_value=1, max_value=n_candles, key="replay_slider",
+                    )
+                    so_far = day_df.iloc[:slider_pos].reset_index(drop=True)
+                    intraday_zones = compute_intraday_zones(so_far)
+                    val_comp, _, _ = cross_validated_zones(composite_zones, intraday_zones)
+
+                    current_time = so_far["timestamp"].iloc[-1].strftime("%H:%M")
+                    st.caption(f"Showing up to {current_time} -- {len(val_comp)} validated zone(s) "
+                               f"at this point in the session.")
+
+                    # Pin the x-axis to the FULL session's span so candles
+                    # stay properly sized from the very first slider
+                    # position, instead of a lone early candle stretching
+                    # to fill the whole chart width.
+                    full_session_range = (day_df["timestamp"].iloc[0], day_df["timestamp"].iloc[-1])
+
+                    fig = plot_candles_with_zones(
+                        so_far,
+                        composite_zones=composite_zones,
+                        intraday_zones=intraday_zones,
+                        validated_zones=val_comp,
+                        title=f"{replay_symbol} replay - {replay_date}",
+                        x_range=full_session_range,
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key="replay_chart_single")
+
+            else:  # Whole sector together
+                available_sectors = sorted(set(
+                    SECTOR_MAP[s] for s in symbols_with_zones if s in SECTOR_MAP
+                ))
+                if not available_sectors:
+                    st.write("No sector data available yet - click 'Run Precompute'.")
+                else:
+                    selected_sector = st.selectbox("Sector", available_sectors, key="replay_sector_select")
+                    sector_symbols = [s for s in symbols_with_zones if SECTOR_MAP.get(s) == selected_sector]
+
+                    if not sector_symbols:
+                        st.write("No symbols with zones in this sector yet.")
+                    else:
+                        # Fetch each symbol's replay data -- fetch_replay_data
+                        # is cached per (symbol, date), so re-picking the
+                        # same sector/date later doesn't re-fetch anything.
+                        per_symbol_data = {}
+                        max_candles = 0
+                        for sym in sector_symbols:
+                            c = cache[sym]
+                            comp_zones, day_df_sym = fetch_replay_data(
+                                c["instrument_key"], token, replay_date.strftime("%Y-%m-%d")
+                            )
+                            if day_df_sym is not None and not day_df_sym.empty:
+                                per_symbol_data[sym] = (comp_zones, day_df_sym)
+                                max_candles = max(max_candles, len(day_df_sym))
+
+                        if not per_symbol_data:
+                            st.write("No candle data for any symbol in this sector on that day. "
+                                     "Try a different date.")
+                        else:
+                            selection_id = f"sector_{selected_sector}_{replay_date}"
+                            if st.session_state.get("replay_selection_id") != selection_id:
+                                st.session_state["replay_selection_id"] = selection_id
+                                st.session_state["replay_slider_sector"] = 1
+                                st.session_state["replay_playing_sector"] = False
+                            elif st.session_state.get("replay_slider_sector", 1) > max_candles:
+                                st.session_state["replay_slider_sector"] = max_candles
+
+                            play_col, restart_col, speed_col = st.columns([1, 1, 2])
+                            with play_col:
+                                playing_s = st.checkbox("Play", key="replay_playing_sector")
+                            with restart_col:
+                                if st.button("Restart", key="replay_restart_sector"):
+                                    st.session_state["replay_slider_sector"] = 1
+                            with speed_col:
+                                speed_ms_s = st.select_slider(
+                                    "Speed", options=[1000, 600, 300, 150], value=600,
+                                    format_func=lambda v: f"{1000 / v:.1f}x", key="replay_speed_sector",
+                                )
+
+                            if playing_s:
+                                st_autorefresh(interval=speed_ms_s, key="replay_autoplay_tick_sector")
+                                if st.session_state["replay_slider_sector"] < max_candles:
+                                    st.session_state["replay_slider_sector"] += 1
+                                else:
+                                    st.session_state["replay_playing_sector"] = False
+
+                            slider_pos_s = st.slider(
+                                "Candles shown (all symbols in this sector advance together)",
+                                min_value=1, max_value=max_candles, key="replay_slider_sector",
+                            )
+
+                            st.markdown(f"## {selected_sector} -- {replay_date}")
+                            symbols_list = list(per_symbol_data.keys())
+                            for i in range(0, len(symbols_list), 2):
+                                row_symbols = symbols_list[i:i + 2]
+                                cols = st.columns(len(row_symbols))
+                                for col, sym in zip(cols, row_symbols):
+                                    with col:
+                                        comp_zones, day_df_sym = per_symbol_data[sym]
+                                        # a symbol with fewer candles than
+                                        # max_candles (e.g. a late listing
+                                        # or a data gap) just stays at its
+                                        # own last available candle rather
+                                        # than erroring
+                                        pos = min(slider_pos_s, len(day_df_sym))
+                                        so_far_sym = day_df_sym.iloc[:pos].reset_index(drop=True)
+                                        intraday_zones_sym = compute_intraday_zones(so_far_sym)
+                                        val_comp_sym, _, _ = cross_validated_zones(comp_zones, intraday_zones_sym)
+                                        full_range_sym = (day_df_sym["timestamp"].iloc[0],
+                                                           day_df_sym["timestamp"].iloc[-1])
+                                        fig_sym = plot_candles_with_zones(
+                                            so_far_sym,
+                                            composite_zones=[], intraday_zones=[],
+                                            validated_zones=val_comp_sym,
+                                            title=sym, height=260, compact=True,
+                                            x_range=full_range_sym,
+                                        )
+                                        st.plotly_chart(fig_sym, use_container_width=True,
+                                                         key=f"replay_sector_chart_{sym}")
 
     with tab_alerts:
         st.caption(
