@@ -948,6 +948,24 @@ def build_zones_display_df(zones):
     return df.sort_values("Level", ascending=False).reset_index(drop=True)
 
 
+def get_session_x_range(df):
+    """Pins the x-axis to the FULL known session hours (09:15-15:30 IST)
+    for today's date, regardless of how many candles have actually formed
+    so far. Without this, early in the session -- right after market
+    open, when only a handful of 5-min candles exist -- Plotly's
+    autorange fits tightly to just those few candles, stretching them to
+    fill the entire chart width."""
+    if df is None or df.empty:
+        return None
+    session_date = df["timestamp"].iloc[0].date()
+    start = datetime.combine(session_date, MARKET_OPEN_TIME)
+    end = datetime.combine(session_date, MARKET_CLOSE_TIME)
+    if df["timestamp"].iloc[0].tzinfo is not None:
+        start = start.replace(tzinfo=IST)
+        end = end.replace(tzinfo=IST)
+    return (start, end)
+
+
 # ---------------- UI (four tabs: Scanner, Key Levels, Chart, Alerts) ----------------
 st.set_page_config(page_title="Sahi Key Levels LIVE", layout="wide")
 st.title("Sahi Key Levels LIVE")
@@ -1125,6 +1143,7 @@ if os.path.exists(CACHE_PATH):
                     intraday_zones=c.get("intraday_zones", []),
                     validated_zones=val_comp,
                     title=f"{chart_symbol} - price with key levels",
+                    x_range=get_session_x_range(chart_df),
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -1167,6 +1186,7 @@ if os.path.exists(CACHE_PATH):
                                 title=sym,
                                 height=260,
                                 compact=True,
+                                x_range=get_session_x_range(grid_df),
                             )
                             st.plotly_chart(fig, use_container_width=True, key=f"sector_chart_{sym}")
 
