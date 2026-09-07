@@ -98,6 +98,11 @@ MARKET_CLOSE_TIME = dtime(15, 30)  # IST - no new alerts logged at/after this
 
 NEAR_ZONE_PCT = 0.3   # how close (%) LTP must be to a validated zone edge to count as "at" it
 
+# --- Paper trading (SIMULATED, no real orders) ---
+PAPER_TRADE_LOG_PATH = "paper_trades.json"
+PAPER_TRADE_SIZE_RUPEES = 25000   # fixed rupee amount per simulated trade
+PAPER_TRADE_ML_RISK_THRESHOLD = 15.0  # entry only if the crossed level's ML break-risk is BELOW this %
+
 # Full liquid NSE F&O universe (not restricted to Nifty 50 anymore) --
 # same universe proven out across the other repos (hvn-lvn-scanner,
 # fno-scanner-strategy-update). NIFTY/BANKNIFTY handled separately below
@@ -697,6 +702,98 @@ def filter_by_room(rows, min_room_pct):
     return [r for r in rows if r.get("next_pct") is None or r["next_pct"] > min_room_pct]
 
 
+def load_paper_trades():
+    if os.path.exists(PAPER_TRADE_LOG_PATH):
+        with open(PAPER_TRADE_LOG_PATH, "r") as f:
+            return json.load(f)
+    return {"trades": []}
+
+
+def save_paper_trades(log):
+    with open(PAPER_TRADE_LOG_PATH, "w") as f:
+        json.dump(log, f, indent=2)
+
+
+def has_open_paper_trade(paper_log, symbol):
+    """One open paper position per symbol at a time -- a simple, sane
+    guardrail against piling into the same name repeatedly."""
+    return any(t["symbol"] == symbol and t["status"] == "open" for t in paper_log["trades"])
+
+
+def open_paper_trade(paper_log, candidate):
+    """candidate: {symbol, direction, entry_price, stop_loss, target,
+    ml_risk_pct, zone_pct}. Skips if the position would round to 0
+    shares at the fixed rupee size (e.g. a very expensive stock)."""
+    qty = int(PAPER_TRADE_SIZE_RUPEES // candidate["entry_price"])
+    if qty < 1:
+        return
+    paper_log["trades"].append({
+        "symbol": candidate["symbol"], "direction": candidate["direction"],
+        "entry_price": candidate["entry_price"],
+        "entry_time": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+        "stop_loss": candidate["stop_loss"], "target": candidate["target"], "qty": qty,
+        "ml_risk_pct": candidate["ml_risk_pct"], "zone_pct": candidate["zone_pct"],
+        "status": "open", "exit_price": None, "exit_time": None,
+        "exit_reason": None, "pnl": None,
+    })
+
+
+def check_paper_trade_exits(paper_log, price_lookup, force_eod=False):
+    """Closes any OPEN paper trade whose stop-loss or target has been
+    hit at the current LTP, or (if force_eod) closes everything still
+    open at end of day. Computes P&L with the correct sign convention
+    for both long and short."""
+    now_str = now_ist().strftime("%Y-%m-%d %H:%M:%S")
+    for t in paper_log["trades"]:
+        if t["status"] != "open":
+            continue
+        ltp = price_lookup.get(t["symbol"])
+        if ltp is None:
+            continue
+        exit_reason = None
+        if t["direction"] == "long":
+            if ltp <= t["stop_loss"]:
+                exit_reason = "stop_loss"
+            elif t["target"] is not None and ltp >= t["target"]:
+                exit_reason = "target"
+        else:  # short
+            if ltp >= t["stop_loss"]:
+                exit_reason = "stop_loss"
+            elif t["target"] is not None and ltp <= t["target"]:
+                exit_reason = "target"
+        if exit_reason is None and force_eod:
+            exit_reason = "end_of_day"
+        if exit_reason:
+            t["status"] = "closed"
+            t["exit_price"] = ltp
+            t["exit_time"] = now_str
+            t["exit_reason"] = exit_reason
+            if t["direction"] == "long":
+                t["pnl"] = round((ltp - t["entry_price"]) * t["qty"], 2)
+            else:
+                t["pnl"] = round((t["entry_price"] - ltp) * t["qty"], 2)
+    return paper_log
+
+
+def build_paper_trades_df(trades, status_filter):
+    rows = [t for t in trades if t["status"] == status_filter]
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    if status_filter == "open":
+        df = df[["symbol", "direction", "entry_price", "stop_loss", "target",
+                  "qty", "ml_risk_pct", "zone_pct", "entry_time"]]
+        df.columns = ["Symbol", "Direction", "Entry", "Stop", "Target",
+                      "Qty", "ML Risk %", "Zone %", "Entry Time"]
+    else:
+        df = df[["symbol", "direction", "entry_price", "exit_price", "qty",
+                  "pnl", "exit_reason", "entry_time", "exit_time"]]
+        df.columns = ["Symbol", "Direction", "Entry", "Exit", "Qty",
+                      "P&L (\u20b9)", "Exit Reason", "Entry Time", "Exit Time"]
+        df = df.sort_values("Exit Time", ascending=False).reset_index(drop=True)
+    return df
+
+
 def run_live_scan(cache, token):
     """Fast tier: one batch quote call for LTP/VWAP, signal recomputed
     against whichever zones are currently cached (may be a few minutes
@@ -717,6 +814,7 @@ def run_live_scan(cache, token):
     top_setups = []          # near resistance + just closed below VWAP
     resistance_breakdowns = []  # pure level cross: price fell through a validated zone
     support_reclaims = []       # pure level cross: price rose through a validated zone
+    paper_trade_candidates = []  # SIMULATED-only: level-cross + same-tick VWAP-cross + low ML risk
 
     for quote_key, q in quotes.items():
         instrument_key = q.get("instrument_token")
@@ -752,6 +850,11 @@ def run_live_scan(cache, token):
                 c.get("composite_zones", []), c.get("intraday_zones", [])
             )
             support, support_dist, resistance, resistance_dist = nearest_zones(ltp, val_comp)
+
+            # defaults so downstream code can safely check these even
+            # when vwap is None (crossed_up/crossed_down never set below)
+            crossed_up = False
+            crossed_down = False
 
             if vwap is not None:
                 vwap_above_now = ltp > vwap
@@ -823,6 +926,59 @@ def run_live_scan(cache, token):
                     "next_pct": round(next_resistance_dist, 2) if next_resistance_dist is not None else None,
                 })
 
+            # --- Paper-trading candidate detection (SIMULATED only) ---
+            # Deliberately stricter than the independent bottom_setups/
+            # top_setups above: requires the level-cross AND the VWAP-
+            # cross to fire on this SAME tick (not just both true at some
+            # point), AND the just-crossed level (now in its FLIPPED
+            # role -- a broken support becomes resistance, a broken
+            # resistance becomes support) must show LOW ML break-risk,
+            # i.e. the model thinks this level will actually hold if
+            # retested -- real conviction behind the move, not a fakeout.
+            # No candidate at all if there's no next zone to use as a
+            # structure-based target (open air = no defined exit plan).
+            day_open = (q.get("ohlc") or {}).get("open") or prev_close
+            if day_open is not None and vwap is not None:
+                for z in level_reclaims:  # bullish: broken level now acts as support
+                    if not crossed_up:
+                        continue
+                    risk = predict_break_probability(
+                        z, ltp=ltp, vwap=vwap, day_open=day_open,
+                        session_start_time=MARKET_OPEN_TIME, session_end_time=MARKET_CLOSE_TIME,
+                        now_time=now_ist().time(), is_intraday_validated=True,
+                    )
+                    if risk is None or risk * 100 >= PAPER_TRADE_ML_RISK_THRESHOLD:
+                        continue
+                    _, _, next_resistance, _ = nearest_zones(ltp, val_comp)
+                    if next_resistance is None:
+                        continue
+                    paper_trade_candidates.append({
+                        "symbol": symbol, "direction": "long", "entry_price": ltp,
+                        "stop_loss": z["price_mode"], "target": next_resistance["price_mode"],
+                        "ml_risk_pct": round(risk * 100, 1),
+                        "zone_pct": _pct_from_label_safe(z["label"]),
+                    })
+
+                for z in level_breakdowns:  # bearish: broken level now acts as resistance
+                    if not crossed_down:
+                        continue
+                    risk = predict_break_probability(
+                        z, ltp=ltp, vwap=vwap, day_open=day_open,
+                        session_start_time=MARKET_OPEN_TIME, session_end_time=MARKET_CLOSE_TIME,
+                        now_time=now_ist().time(), is_intraday_validated=True,
+                    )
+                    if risk is None or risk * 100 >= PAPER_TRADE_ML_RISK_THRESHOLD:
+                        continue
+                    next_support, _, _, _ = nearest_zones(ltp, val_comp)
+                    if next_support is None:
+                        continue
+                    paper_trade_candidates.append({
+                        "symbol": symbol, "direction": "short", "entry_price": ltp,
+                        "stop_loss": z["price_mode"], "target": next_support["price_mode"],
+                        "ml_risk_pct": round(risk * 100, 1),
+                        "zone_pct": _pct_from_label_safe(z["label"]),
+                    })
+
         rows.append({
             "Symbol": symbol, "PrevClose": prev_close, "LTP": ltp,
             "Change%": change_pct, "VWAP": vwap, "RVOL%": rvol_pct, "Signal": signal,
@@ -839,7 +995,8 @@ def run_live_scan(cache, token):
         df["Top5RVOL"] = df["Symbol"].isin(top_n_symbols)
         df = df.sort_values("RVOL%", ascending=False, na_position="last").reset_index(drop=True)
         df.insert(0, "S.No", range(1, len(df) + 1))
-    return df, signals, top_n_symbols, bottom_setups, top_setups, resistance_breakdowns, support_reclaims
+    return (df, signals, top_n_symbols, bottom_setups, top_setups, resistance_breakdowns,
+            support_reclaims, paper_trade_candidates)
 
 
 def _pct_from_label_safe(label):
@@ -1091,7 +1248,8 @@ if os.path.exists(CACHE_PATH):
 
     if refresh_quotes_clicked or refresh_zones_clicked or auto_quotes_due or auto_zone_due or "last_scan_df" not in st.session_state:
         token = get_token()
-        scan_df, signals, top_n_symbols, bottom_setups, top_setups, resistance_breakdowns, support_reclaims = run_live_scan(cache, token)
+        (scan_df, signals, top_n_symbols, bottom_setups, top_setups, resistance_breakdowns,
+         support_reclaims, paper_trade_candidates) = run_live_scan(cache, token)
 
         alert_log = load_alert_log()
         alert_log = update_alert_log(alert_log, signals, top_n_symbols)
@@ -1107,6 +1265,24 @@ if os.path.exists(CACHE_PATH):
         st.session_state["top_setups"] = top_setups
         st.session_state["resistance_breakdowns"] = resistance_breakdowns
         st.session_state["support_reclaims"] = support_reclaims
+
+        # --- Paper trading (SIMULATED, no real orders) ---
+        # Check exits on EXISTING open positions FIRST, then open new
+        # candidates AFTER -- critical ordering. Doing it the other way
+        # (open then immediately check) would let a freshly-opened trade
+        # get evaluated for exit at the exact same tick/price it just
+        # opened at, which is meaningless (entry==exit, 0 P&L every
+        # time) and was happening for anything opened after market
+        # close, when force_eod is already true.
+        paper_log = load_paper_trades()
+        scan_price_lookup = dict(zip(scan_df["Symbol"], scan_df["LTP"])) if not scan_df.empty else {}
+        market_closing_now = now_ist().time() >= MARKET_CLOSE_TIME
+        paper_log = check_paper_trade_exits(paper_log, scan_price_lookup, force_eod=market_closing_now)
+        for candidate in paper_trade_candidates:
+            if not has_open_paper_trade(paper_log, candidate["symbol"]):
+                open_paper_trade(paper_log, candidate)
+        save_paper_trades(paper_log)
+        st.session_state["paper_log"] = paper_log
 
     df = st.session_state.get("last_scan_df", pd.DataFrame())
     price_lookup = dict(zip(df["Symbol"], df["LTP"])) if not df.empty else {}
@@ -1141,9 +1317,51 @@ if os.path.exists(CACHE_PATH):
 
     st.divider()
 
-    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_setups, tab_replay, tab_alerts = st.tabs(
-        ["Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Setups", "Replay", "Alerts"]
+    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_setups, tab_paper, tab_replay, tab_alerts = st.tabs(
+        ["Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Setups", "Paper Trading", "Replay", "Alerts"]
     )
+
+    with tab_paper:
+        st.warning(
+            "**SIMULATED ONLY -- no real orders are ever placed.** This tracks what "
+            "would have happened if trades were taken automatically on a strict rule: "
+            "a level-cross AND a same-tick VWAP-cross in the same direction, AND the "
+            f"just-crossed level (now in its flipped role) shows ML break-risk below "
+            f"{PAPER_TRADE_ML_RISK_THRESHOLD:.0f}% -- i.e. the model thinks that level "
+            f"will actually hold if retested, real conviction rather than a fakeout. "
+            f"Position size is a fixed \u20b9{PAPER_TRADE_SIZE_RUPEES:,} per trade. Stop-loss "
+            f"is the crossed level itself; target is the next validated zone in that "
+            f"direction (no trade at all if there's no next zone to use as a target). "
+            f"One open position per symbol at a time."
+        )
+        paper_log = st.session_state.get("paper_log") or load_paper_trades()
+        all_trades = paper_log.get("trades", [])
+        closed_trades = [t for t in all_trades if t["status"] == "closed"]
+
+        if closed_trades:
+            total_pnl = sum(t["pnl"] for t in closed_trades)
+            wins = [t for t in closed_trades if t["pnl"] > 0]
+            win_rate = len(wins) / len(closed_trades) * 100
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total simulated P&L", f"\u20b9{total_pnl:,.0f}")
+            col2.metric("Win rate", f"{win_rate:.0f}%")
+            col3.metric("Trades closed", len(closed_trades))
+
+        st.markdown("**Open positions**")
+        open_df = build_paper_trades_df(all_trades, "open")
+        if open_df.empty:
+            st.write("No open simulated positions right now.")
+        else:
+            st.dataframe(open_df, use_container_width=True, hide_index=True)
+
+        st.markdown("**Closed trades**")
+        closed_df = build_paper_trades_df(all_trades, "closed")
+        if closed_df.empty:
+            st.write("No closed simulated trades yet.")
+        else:
+            st.dataframe(closed_df, use_container_width=True, hide_index=True)
+            csv = closed_df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download closed trades CSV", csv, "paper_trades.csv", "text/csv")
 
     with tab_scanner:
         st.caption(f"Last refreshed: {st.session_state.get('last_refresh_time', 'never')}")
