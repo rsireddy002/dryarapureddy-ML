@@ -1,10 +1,110 @@
 {
-  "alerts": [],
+  "alerts": [
+    {
+      "symbol": "CDSL",
+      "signal": "BUY",
+      "ltp": 1430.2,
+      "vwap": 1415.65,
+      "rvol_pct": 74.4,
+      "time": "2026-09-07 10:13:10",
+      "is_latest": true
+    },
+    {
+      "symbol": "CGPOWER",
+      "signal": "SELL",
+      "ltp": 901.5,
+      "vwap": 905.82,
+      "rvol_pct": 74.8,
+      "time": "2026-09-07 10:13:10",
+      "is_latest": true
+    },
+    {
+      "symbol": "RVNL",
+      "signal": "SELL",
+      "ltp": 213.78,
+      "vwap": 214.28,
+      "rvol_pct": 174.7,
+      "time": "2026-09-07 10:13:10",
+      "is_latest": true
+    },
+    {
+      "symbol": "PVRINOX",
+      "signal": "SELL",
+      "ltp": 1140.4,
+      "vwap": 1151.7,
+      "rvol_pct": 274.3,
+      "time": "2026-09-07 10:13:10",
+      "is_latest": false
+    },
+    {
+      "symbol": "PVRINOX",
+      "signal": "BUY",
+      "ltp": 1149.8,
+      "vwap": 1146.96,
+      "rvol_pct": 434.1,
+      "time": "2026-09-07 11:52:10",
+      "is_latest": true
+    },
+    {
+      "symbol": "TITAGARH",
+      "signal": "BUY",
+      "ltp": 893.05,
+      "vwap": 887.89,
+      "rvol_pct": 142.5,
+      "time": "2026-09-07 11:52:10",
+      "is_latest": true
+    },
+    {
+      "symbol": "GNFC",
+      "signal": "SELL",
+      "ltp": 598.5,
+      "vwap": 599.67,
+      "rvol_pct": 134.1,
+      "time": "2026-09-07 11:53:59",
+      "is_latest": true
+    },
+    {
+      "symbol": "KEI",
+      "signal": "SELL",
+      "ltp": 4722.0,
+      "vwap": 4746.77,
+      "rvol_pct": 140.1,
+      "time": "2026-09-07 12:22:27",
+      "is_latest": false
+    },
+    {
+      "symbol": "CUB",
+      "signal": "SELL",
+      "ltp": 242.5,
+      "vwap": 244.03,
+      "rvol_pct": 166.3,
+      "time": "2026-09-07 12:48:32",
+      "is_latest": true
+    },
+    {
+      "symbol": "KEI",
+      "signal": "SELL",
+      "ltp": 4699.5,
+      "vwap": 4742.75,
+      "rvol_pct": 166.6,
+      "time": "2026-09-07 12:58:33",
+      "is_latest": false
+    },
+    {
+      "symbol": "KEI",
+      "signal": "SELL",
+      "ltp": 4690.0,
+      "vwap": 4738.12,
+      "rvol_pct": 184.9,
+      "time": "2026-09-07 13:48:10",
+      "is_latest": true
+    }
+  ],
   "last_eligible_symbols": [
-    "KEI",
-    "ANGELONE",
+    "CUB",
+    "PVRINOX",
     "TITAGARH",
-    "GICRE",
-    "POLYCAB"
+    "RVNL",
+    "KEI"
   ]
 }

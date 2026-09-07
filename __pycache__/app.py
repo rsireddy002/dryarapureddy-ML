@@ -1110,7 +1110,6 @@ if os.path.exists(CACHE_PATH):
 
     df = st.session_state.get("last_scan_df", pd.DataFrame())
     price_lookup = dict(zip(df["Symbol"], df["LTP"])) if not df.empty else {}
-    rvol_lookup = dict(zip(df["Symbol"], df["RVOL%"])) if not df.empty else {}
     alert_log = st.session_state.get("alert_log") or load_alert_log()
 
     symbols_with_zones = [s for s in cache if cache[s].get("composite_zones") or cache[s].get("intraday_zones")]
@@ -1141,8 +1140,8 @@ if os.path.exists(CACHE_PATH):
 
     st.divider()
 
-    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_setups, tab_replay, tab_alerts = st.tabs(
-        ["Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Setups", "Replay", "Alerts"]
+    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_setups, tab_replay, tab_alerts = st.tabs(
+        ["Scanner", "Key Levels", "Chart", "Sectors", "Setups", "Replay", "Alerts"]
     )
 
     with tab_scanner:
@@ -1201,15 +1200,12 @@ if os.path.exists(CACHE_PATH):
                     c.get("composite_zones", []), c.get("intraday_zones", [])
                 )
                 ml_lookup = build_ml_risk_lookup(c.get("composite_zones", []), val_comp, chart_df)
-                chart_rvol = rvol_lookup.get(chart_symbol)
-                chart_title = (f"{chart_symbol} - price with key levels (RVOL {chart_rvol:.0f}%)"
-                               if chart_rvol is not None else f"{chart_symbol} - price with key levels")
                 fig = plot_candles_with_zones(
                     chart_df,
                     composite_zones=c.get("composite_zones", []),
                     intraday_zones=c.get("intraday_zones", []),
                     validated_zones=val_comp,
-                    title=chart_title,
+                    title=f"{chart_symbol} - price with key levels",
                     x_range=get_session_x_range(chart_df),
                     ml_risk_lookup=ml_lookup,
                 )
@@ -1266,14 +1262,12 @@ if os.path.exists(CACHE_PATH):
                             ml_lookup = build_ml_risk_lookup(
                                 c.get("composite_zones", []), val_comp, grid_df
                             )
-                            grid_rvol = rvol_lookup.get(sym)
-                            grid_title = f"{sym} (RVOL {grid_rvol:.0f}%)" if grid_rvol is not None else sym
                             fig = plot_candles_with_zones(
                                 grid_df,
                                 composite_zones=[],   # hide faint reference lines in grid view -- too busy at small size
                                 intraday_zones=[],
                                 validated_zones=val_comp,
-                                title=grid_title,
+                                title=sym,
                                 height=260,
                                 compact=True,
                                 x_range=get_session_x_range(grid_df),
@@ -1312,27 +1306,6 @@ if os.path.exists(CACHE_PATH):
                         st.markdown(f"## {sector}")
                         render_symbol_grid(sector_symbols, token)
                         st.divider()
-
-    with tab_rvol:
-        st.caption(
-            "Every stock with zones ranked by RVOL, highest first -- ignores sector "
-            "grouping entirely, so the most active names across the WHOLE universe "
-            "float to the top regardless of which sector they're in. Same charts, zone "
-            "lines, and ML risk labels as the Sectors tab -- just a different ordering."
-        )
-        rvol_ranked_symbols = sorted(
-            [s for s in symbols_with_zones if rvol_lookup.get(s) is not None],
-            key=lambda s: rvol_lookup[s], reverse=True,
-        )
-        if not rvol_ranked_symbols:
-            st.write("No RVOL data yet -- click 'Refresh Quotes'.")
-        else:
-            top_n_rvol_charts = st.slider(
-                "Show top N by RVOL", min_value=5, max_value=len(rvol_ranked_symbols),
-                value=min(10, len(rvol_ranked_symbols)), key="rvol_tab_top_n",
-            )
-            token = get_token()
-            render_symbol_grid(rvol_ranked_symbols[:top_n_rvol_charts], token)
 
     with tab_setups:
         st.markdown("### Level breaks (fires the instant price crosses a level -- no VWAP needed)")
