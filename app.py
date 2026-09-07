@@ -295,6 +295,14 @@ SECTOR_MAP = {
 
 
 def get_token():
+    # Sidebar-entered token takes priority -- lets you paste a fresh
+    # token here each day without touching the systemd service file or
+    # restarting anything, and keeps this app's token independent from
+    # whatever the other app/listener is using (avoids session clashes
+    # from two connections sharing one token).
+    sidebar_token = st.session_state.get("manual_token")
+    if sidebar_token:
+        return sidebar_token.strip()
     token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     if token:
         return token.strip()
@@ -309,8 +317,8 @@ def get_token():
         if t and t != "PASTE_YOUR_TOKEN_HERE":
             return t
     raise RuntimeError(
-        "No token found. Set $env:UPSTOX_ACCESS_TOKEN, add UPSTOX_ACCESS_TOKEN to Streamlit "
-        "secrets, or create upstox_token.txt."
+        "No token found. Enter one in the sidebar, set $env:UPSTOX_ACCESS_TOKEN, add "
+        "UPSTOX_ACCESS_TOKEN to Streamlit secrets, or create upstox_token.txt."
     )
 
 
@@ -943,6 +951,16 @@ def build_zones_display_df(zones):
 # ---------------- UI (four tabs: Scanner, Key Levels, Chart, Alerts) ----------------
 st.set_page_config(page_title="Sahi Key Levels LIVE", layout="wide")
 st.title("Sahi Key Levels LIVE")
+
+with st.sidebar:
+    st.markdown("### Daily token")
+    st.text_input(
+        "Upstox access token (paste today's token here)",
+        type="password", key="manual_token",
+        help="Overrides the server's fixed token for this app only -- replace it here each "
+             "day instead of editing the systemd service.",
+    )
+
 st.caption(
     "Cross-timeframe validated zones: a level only counts if BOTH the 18-day composite "
     "profile and today's intraday profile independently show volume clustered there."
