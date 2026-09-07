@@ -627,6 +627,41 @@ def nearest_zones(ltp, validated_zones):
     return support, support_dist, resistance, resistance_dist
 
 
+def build_wide_range_df(cache, price_lookup):
+    """Ranks every stock by the GAP between its nearest validated support
+    and nearest validated resistance -- i.e. how much room price actually
+    has to move before hitting a wall in either direction. A stock with a
+    tight gap is already boxed in; a wide gap means real room for a move
+    to develop (breakout continuation or range play) without immediately
+    running into the next level. Only includes symbols with BOTH a
+    validated support and resistance currently identified -- a stock with
+    open air on one side has an undefined "gap" (not comparable)."""
+    rows = []
+    for symbol, c in cache.items():
+        ltp = price_lookup.get(symbol)
+        if ltp is None:
+            continue
+        val_comp, _, _ = cross_validated_zones(
+            c.get("composite_zones", []), c.get("intraday_zones", [])
+        )
+        support, _, resistance, _ = nearest_zones(ltp, val_comp)
+        if support is None or resistance is None:
+            continue
+        gap_price = resistance["price_mode"] - support["price_mode"]
+        if gap_price <= 0:
+            continue  # shouldn't happen given nearest_zones' split logic, but guard anyway
+        gap_pct = gap_price / ltp * 100
+        rows.append({
+            "Symbol": symbol, "LTP": ltp,
+            "Support": support["price_mode"], "Resistance": resistance["price_mode"],
+            "Gap": round(gap_price, 2), "Gap %": round(gap_pct, 2),
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values("Gap %", ascending=False).reset_index(drop=True)
+
+
 def crossed_zones(prev_ltp, ltp, validated_zones):
     """Detects a zone LEVEL actually being crossed between the previous
     and current scan tick -- no VWAP condition, no 'near' threshold,
@@ -1317,8 +1352,8 @@ if os.path.exists(CACHE_PATH):
 
     st.divider()
 
-    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_setups, tab_paper, tab_replay, tab_alerts = st.tabs(
-        ["Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Setups", "Paper Trading", "Replay", "Alerts"]
+    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_range, tab_setups, tab_paper, tab_replay, tab_alerts = st.tabs(
+        ["Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Wide Range", "Setups", "Paper Trading", "Replay", "Alerts"]
     )
 
     with tab_paper:
@@ -1463,11 +1498,18 @@ if os.path.exists(CACHE_PATH):
                 horizontal=True, key="sector_view_mode",
             )
 
-            def render_symbol_grid(symbols_list, token):
+            def render_symbol_grid(symbols_list, token, key_prefix="sector"):
                 # 2 charts per row, each an independent chart with its
                 # own zone lines and ML risk labels visible directly on
                 # the chart (confirmed working) -- see chat history if
                 # revisiting the synced-crosshair subplot version later.
+                # key_prefix keeps chart widget keys unique across the
+                # different tabs that all call this same function
+                # (Sectors, By RVOL, Wide Range) -- since Streamlit runs
+                # every tab's code every rerun regardless of which is
+                # visually active, the same symbol appearing in two
+                # tabs' calls in the same run would otherwise collide on
+                # an identical hardcoded key.
                 for i in range(0, len(symbols_list), 2):
                     row_symbols = symbols_list[i:i + 2]
                     cols = st.columns(len(row_symbols))
@@ -1497,7 +1539,7 @@ if os.path.exists(CACHE_PATH):
                                 x_range=get_session_x_range(grid_df),
                                 ml_risk_lookup=ml_lookup,
                             )
-                            st.plotly_chart(fig, use_container_width=True, key=f"sector_chart_{sym}")
+                            st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_chart_{sym}")
 
             if view_mode == "One sector at a time":
                 selected_sector = st.selectbox("Sector", available_sectors, key="sector_select")
@@ -1550,7 +1592,31 @@ if os.path.exists(CACHE_PATH):
                 value=min(10, len(rvol_ranked_symbols)), key="rvol_tab_top_n",
             )
             token = get_token()
-            render_symbol_grid(rvol_ranked_symbols[:top_n_rvol_charts], token)
+            render_symbol_grid(rvol_ranked_symbols[:top_n_rvol_charts], token, key_prefix="rvol")
+
+    with tab_range:
+        st.caption(
+            "Every stock ranked by the GAP between its nearest validated support "
+            "and resistance -- i.e. how much room price actually has to move "
+            "before hitting a wall in either direction. A wide gap means real "
+            "room for a move to develop (breakout continuation or a range play) "
+            "without immediately running into the next level. Only includes "
+            "stocks with BOTH a support AND a resistance currently validated -- "
+            "open air on one side makes the gap undefined, not comparable."
+        )
+        wide_range_df = build_wide_range_df(cache, price_lookup)
+        if wide_range_df.empty:
+            st.write("No stocks with both a validated support and resistance right now.")
+        else:
+            top_n_range = st.slider(
+                "Show top N by gap", min_value=5, max_value=len(wide_range_df),
+                value=min(10, len(wide_range_df)), key="range_tab_top_n",
+            )
+            shown_range_df = wide_range_df.head(top_n_range)
+            st.dataframe(shown_range_df, use_container_width=True, hide_index=True)
+            st.divider()
+            token = get_token()
+            render_symbol_grid(shown_range_df["Symbol"].tolist(), token, key_prefix="range")
 
     with tab_setups:
         st.markdown("### Level breaks (fires the instant price crosses a level -- no VWAP needed)")
