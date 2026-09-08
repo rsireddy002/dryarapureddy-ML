@@ -31,6 +31,7 @@ Matches the zone dict shape from sahi_style_key_levels():
 
 import re
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 
 # TradingView-style dark theme palette
@@ -429,5 +430,70 @@ def build_synced_sector_grid(symbol_panels, cols=2, height_per_row=260):
         height=height_per_row * rows,
         showlegend=False,
         margin=dict(l=50, r=50, t=40, b=20),
+    )
+    return fig
+
+
+def compute_cumulative_volume_delta(df):
+    """Approximates volume delta per candle from plain OHLCV data --
+    Upstox's REST candle API doesn't provide bid/ask-tagged tick data,
+    so this uses the standard candle-color approximation instead of
+    true order-flow delta: an up-close candle counts its full volume as
+    buying pressure, a down-close candle as selling pressure, a flat
+    candle as neutral. Returns the running cumulative sum across the
+    session. This is a widely-used proxy when tick data isn't
+    available, but it is an approximation, not tick-accurate CVD."""
+    delta = np.where(df["close"] > df["open"], df["volume"],
+                      np.where(df["close"] < df["open"], -df["volume"], 0))
+    return pd.Series(delta, index=df.index).cumsum()
+
+
+def build_cvd_chart(df, height=100, compact=False, x_range=None):
+    """A small bar chart of cumulative volume delta, meant to sit
+    directly below a price chart from plot_candles_with_zones -- same
+    time range, same color language (teal=net buying, red=net
+    selling), so it reads as a companion panel even though it's a
+    separate figure rather than a true shared-axis subplot.
+
+    x_range should be the SAME value passed to plot_candles_with_zones
+    for the price chart above it -- without this, this chart's x-axis
+    auto-scales to just the candles that exist so far, while the price
+    chart above is pinned to the full session, making these bars look
+    stretched wider than the actual candles they correspond to."""
+    if df is None or df.empty:
+        return go.Figure()
+    cvd = compute_cumulative_volume_delta(df)
+    colors = [CANDLE_UP if v >= 0 else CANDLE_DOWN for v in cvd]
+
+    # explicit bar width matching the actual candle interval, so bars
+    # never render wider than their corresponding candle regardless of
+    # how the x-axis range is scaled
+    if len(df) > 1:
+        interval_ms = df["timestamp"].diff().dropna().dt.total_seconds().median() * 1000
+        bar_width_ms = interval_ms * 0.8
+    else:
+        bar_width_ms = None
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=df["timestamp"], y=cvd, marker_color=colors, showlegend=False,
+                          width=bar_width_ms))
+    xaxis_config = dict(showticklabels=not compact, gridcolor=GRID_COLOR, showgrid=not compact)
+    if x_range is not None:
+        xaxis_config["range"] = list(x_range)
+    fig.update_layout(
+        height=height,
+        # left/right margins must match plot_candles_with_zones' EXACTLY
+        # (compact: l=45,r=55 / non-compact: l=55,r=130) -- these are two
+        # separate figures stacked visually, not true shared-axis
+        # subplots, so the same timestamp only lands at the same pixel
+        # position in both if their plot areas start/end at the same
+        # horizontal offset. Top/bottom margins don't affect this and
+        # can differ freely.
+        margin=(dict(l=45, r=55, t=10, b=10) if compact
+                else dict(l=55, r=130, t=10, b=20)),
+        paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR,
+        font=dict(color=TEXT_COLOR, size=9 if compact else 11),
+        xaxis=xaxis_config,
+        yaxis=dict(title=None if compact else "Cum. Vol Delta", gridcolor=GRID_COLOR),
     )
     return fig
