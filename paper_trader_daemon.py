@@ -601,7 +601,12 @@ def main():
             log.error(f"Cycle failed ({consecutive_errors} in a row): {e}")
 
         write_heartbeat(last_successful_scan, last_error, consecutive_errors)
-        time.sleep(seconds_until_next_check(now))
+        # Re-read the clock HERE, right before scheduling sleep -- using
+        # the stale `now` captured at the top of this iteration would
+        # understate how much time has actually passed if Precompute (or
+        # any slow cycle) ran in between, causing the next wake-up to
+        # drift earlier than the true next candle boundary.
+        time.sleep(seconds_until_next_check(now_ist()))
 
 
 if __name__ == "__main__":
