@@ -1741,6 +1741,38 @@ if os.path.exists(CACHE_PATH):
                             )
                             st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_chart_{sym}")
 
+                            long_c = build_manual_trade_candidate("long", sym, val_comp, grid_df)
+                            short_c = build_manual_trade_candidate("short", sym, val_comp, grid_df)
+                            bcol, scol = st.columns(2)
+                            with bcol:
+                                if long_c is not None:
+                                    tgt = f"{long_c['target']:.1f}" if long_c['target'] is not None else "open"
+                                    st.caption(f"SL {long_c['stop_loss']:.1f} / T {tgt}")
+                                    if st.button("Buy", key=f"{key_prefix}_buy_{sym}"):
+                                        grid_paper_log = load_paper_trades()
+                                        if has_open_paper_trade(grid_paper_log, sym):
+                                            st.warning(f"Already open in {sym}.")
+                                        elif open_paper_trade(grid_paper_log, long_c):
+                                            save_paper_trades(grid_paper_log)
+                                            st.session_state["paper_log"] = grid_paper_log
+                                            st.success(f"LONG opened: {sym}")
+                                        else:
+                                            st.warning("Qty rounds to 0 -- not opened.")
+                            with scol:
+                                if short_c is not None:
+                                    tgt = f"{short_c['target']:.1f}" if short_c['target'] is not None else "open"
+                                    st.caption(f"SL {short_c['stop_loss']:.1f} / T {tgt}")
+                                    if st.button("Sell", key=f"{key_prefix}_sell_{sym}"):
+                                        grid_paper_log = load_paper_trades()
+                                        if has_open_paper_trade(grid_paper_log, sym):
+                                            st.warning(f"Already open in {sym}.")
+                                        elif open_paper_trade(grid_paper_log, short_c):
+                                            save_paper_trades(grid_paper_log)
+                                            st.session_state["paper_log"] = grid_paper_log
+                                            st.success(f"SHORT opened: {sym}")
+                                        else:
+                                            st.warning("Qty rounds to 0 -- not opened.")
+
             if view_mode == "One sector at a time":
                 selected_sector = st.selectbox("Sector", available_sectors, key="sector_select")
                 sector_symbols = [s for s in symbols_with_zones if SECTOR_MAP.get(s) == selected_sector]
