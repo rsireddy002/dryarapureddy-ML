@@ -44,6 +44,7 @@ import pandas as pd
 from sahi_style_key_levels import sahi_style_key_levels
 from zone_validation import cross_validated_zones
 from ml_predict import predict_break_probability
+from candles_with_levels import compute_cumulative_volume_delta
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,6 +79,7 @@ MARKET_CLOSE_TIME = dtime(15, 30)
 
 PAPER_TRADE_SIZE_RUPEES = 25000
 PAPER_TRADE_ML_RISK_THRESHOLD = 15.0
+PAPER_TRADE_UNIVERSE_TOP_N = 10  # only the top-N Wide Range stocks (widest support-resistance gap) are eligible for entries
 
 ZONE_REFRESH_INTERVAL_SECONDS = 300   # ~5 min
 CANDLE_INTERVAL_MINUTES = 5
@@ -257,6 +259,32 @@ def nearest_zones(ltp, validated_zones):
             if resistance_dist is None or dist < resistance_dist:
                 resistance, resistance_dist = z, dist
     return support, support_dist, resistance, resistance_dist
+
+
+def get_top_wide_range_symbols(cache, price_lookup, top_n=10):
+    """Ranks symbols by the gap % between nearest validated support and
+    resistance (genuine room to move), returns the top_n symbol names.
+    Mirrors the interactive app's Wide Range tab logic exactly. Uses
+    zones already in cache and prices already fetched this cycle, so
+    this costs no extra API calls."""
+    rows = []
+    for symbol, c in cache.items():
+        ltp = price_lookup.get(symbol)
+        if ltp is None:
+            continue
+        val_comp, _, _ = cross_validated_zones(
+            c.get("composite_zones", []), c.get("intraday_zones", [])
+        )
+        support, _, resistance, _ = nearest_zones(ltp, val_comp)
+        if support is None or resistance is None:
+            continue
+        gap_price = resistance["price_mode"] - support["price_mode"]
+        if gap_price <= 0:
+            continue
+        gap_pct = gap_price / ltp * 100
+        rows.append((symbol, gap_pct))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in rows[:top_n]]
 
 
 def crossed_zones(prev_ltp, ltp, validated_zones):
@@ -445,15 +473,34 @@ def load_cache():
 
 def run_scan_cycle(cache, token, paper_log):
     """One quote-scan cycle: fetch prices, detect entry candidates
-    (level-cross + same-tick VWAP-cross + low ML risk), check exits on
-    open positions, open any new qualifying ones. Mutates cache and
-    paper_log in place; caller is responsible for saving both."""
+    (level-cross + same-tick VWAP-cross + low ML risk + CVD confirming
+    the trade direction), restricted to the top Wide Range stocks
+    (genuine room to move) instead of the full 220+ universe -- check
+    exits on open positions, open any new qualifying ones. Mutates
+    cache and paper_log in place; caller is responsible for saving
+    both."""
     symbols = list(cache.keys())
     instrument_keys = [cache[s]["instrument_key"] for s in symbols]
     key_to_symbol = {cache[s]["instrument_key"]: s for s in symbols}
     quotes = fetch_batch_quotes(instrument_keys, token)
 
+    # Pass 1: extract every price from this cycle's quotes FIRST -- the
+    # wide-range ranking needs ALL prices known before it can pick a
+    # meaningful top-N, so this can't be built incrementally in the
+    # same loop that generates candidates.
     price_lookup = {}
+    for q in quotes.values():
+        sym = key_to_symbol.get(q.get("instrument_token"))
+        if sym and q.get("last_price") is not None:
+            price_lookup[sym] = q["last_price"]
+
+    top_wide_range_symbols = set(get_top_wide_range_symbols(
+        cache, price_lookup, top_n=PAPER_TRADE_UNIVERSE_TOP_N
+    ))
+
+    # Pass 2: VWAP-cross/level-cross state updates (every symbol, same
+    # as before) and candidate generation (only for the restricted
+    # universe, with the added CVD gate).
     candidates = []
 
     for quote_key, q in quotes.items():
@@ -465,8 +512,6 @@ def run_scan_cycle(cache, token, paper_log):
         ltp = q.get("last_price")
         vwap = q.get("average_price")
         prev_close = c.get("prev_close")
-        if ltp is not None:
-            price_lookup[symbol] = ltp
 
         if ltp is None:
             continue
@@ -488,10 +533,22 @@ def run_scan_cycle(cache, token, paper_log):
         cache[symbol]["prev_ltp"] = ltp
 
         day_open = (q.get("ohlc") or {}).get("open") or prev_close
-        if day_open is not None and vwap is not None:
+        if day_open is not None and vwap is not None and symbol in top_wide_range_symbols:
+            # CVD needs actual candle data (not in the quotes response)
+            # -- fetched lazily, only for restricted-universe symbols
+            # that already have a level-cross this tick, to keep this
+            # cheap despite the extra per-symbol API call it requires.
+            latest_cvd = None
+            if level_reclaims or level_breakdowns:
+                cvd_candles = fetch_today_candles(c["instrument_key"], token)
+                if not cvd_candles.empty:
+                    latest_cvd = compute_cumulative_volume_delta(cvd_candles).iloc[-1]
+
             for z in level_reclaims:
                 if not crossed_up:
                     continue
+                if latest_cvd is None or latest_cvd <= 0:
+                    continue  # need net BUYING pressure to confirm a long
                 risk = predict_break_probability(
                     z, ltp=ltp, vwap=vwap, day_open=day_open,
                     session_start_time=MARKET_OPEN_TIME, session_end_time=MARKET_CLOSE_TIME,
@@ -511,6 +568,8 @@ def run_scan_cycle(cache, token, paper_log):
             for z in level_breakdowns:
                 if not crossed_down:
                     continue
+                if latest_cvd is None or latest_cvd >= 0:
+                    continue  # need net SELLING pressure to confirm a short
                 risk = predict_break_probability(
                     z, ltp=ltp, vwap=vwap, day_open=day_open,
                     session_start_time=MARKET_OPEN_TIME, session_end_time=MARKET_CLOSE_TIME,

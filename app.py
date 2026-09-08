@@ -60,7 +60,7 @@ from streamlit_autorefresh import st_autorefresh
 from hvn_lvn import build_volume_profile, find_hvn_lvn
 from sahi_style_key_levels import sahi_style_key_levels
 from zone_validation import cross_validated_zones, compute_zone_signal
-from candles_with_levels import plot_candles_with_zones, build_cvd_chart
+from candles_with_levels import plot_candles_with_zones, build_cvd_chart, compute_cumulative_volume_delta
 from ml_predict import predict_break_probability
 from live_feed_reader import get_live_candles
 
@@ -118,6 +118,7 @@ PAPER_TRADE_LOG_PATH = "paper_trades.json"
 HEARTBEAT_PATH = "daemon_heartbeat.json"
 PAPER_TRADE_SIZE_RUPEES = 25000   # fixed rupee amount per simulated trade
 PAPER_TRADE_ML_RISK_THRESHOLD = 15.0  # entry only if the crossed level's ML break-risk is BELOW this %
+PAPER_TRADE_UNIVERSE_TOP_N = 10  # only the top-N Wide Range stocks (widest support-resistance gap) are eligible for entries
 
 # Full liquid NSE F&O universe (not restricted to Nifty 50 anymore) --
 # same universe proven out across the other repos (hvn-lvn-scanner,
@@ -726,6 +727,19 @@ def build_wide_range_df(cache, price_lookup):
     return df.sort_values("Gap %", ascending=False).reset_index(drop=True)
 
 
+def get_top_wide_range_symbols(cache, price_lookup, top_n=10):
+    """Same ranking as build_wide_range_df, but returns just the top_n
+    symbol names -- used to restrict the paper-trading entry universe
+    to stocks with genuine room to move, instead of scanning all 220+
+    stocks every cycle. Reuses zones already in cache and prices
+    already fetched this cycle, so the ranking itself costs no extra
+    API calls."""
+    df = build_wide_range_df(cache, price_lookup)
+    if df.empty:
+        return []
+    return df["Symbol"].head(top_n).tolist()
+
+
 def crossed_zones(prev_ltp, ltp, validated_zones):
     """Detects a zone LEVEL actually being crossed between the previous
     and current scan tick -- no VWAP condition, no 'near' threshold,
@@ -975,6 +989,21 @@ def run_live_scan(cache, token):
     support_reclaims = []       # pure level cross: price rose through a validated zone
     paper_trade_candidates = []  # SIMULATED-only: level-cross + same-tick VWAP-cross + low ML risk
 
+    # Restrict paper-trading entries to the top Wide Range stocks --
+    # genuine room to move, instead of scanning all 220+ stocks every
+    # cycle. Ranking uses zones already cached and prices already
+    # about to be parsed below, so this costs no extra API calls; the
+    # quick first pass just extracts LTPs from the same quotes response
+    # already fetched above.
+    _price_lookup_for_ranking = {}
+    for _q in quotes.values():
+        _sym = key_to_symbol.get(_q.get("instrument_token"))
+        if _sym and _q.get("last_price") is not None:
+            _price_lookup_for_ranking[_sym] = _q["last_price"]
+    top_wide_range_symbols = set(get_top_wide_range_symbols(
+        cache, _price_lookup_for_ranking, top_n=PAPER_TRADE_UNIVERSE_TOP_N
+    ))
+
     for quote_key, q in quotes.items():
         instrument_key = q.get("instrument_token")
         symbol = key_to_symbol.get(instrument_key)
@@ -1096,11 +1125,26 @@ def run_live_scan(cache, token):
             # retested -- real conviction behind the move, not a fakeout.
             # No candidate at all if there's no next zone to use as a
             # structure-based target (open air = no defined exit plan).
+            # Restricted to the top Wide Range stocks (genuine room to
+            # move) AND requires cumulative volume delta to agree with
+            # the trade direction -- net buying pressure for a long, net
+            # selling for a short. CVD needs actual candle data (not
+            # available from the quotes response), so it's only fetched
+            # here, lazily, for symbols that already passed every other
+            # filter -- keeps this restricted-universe design cheap.
             day_open = (q.get("ohlc") or {}).get("open") or prev_close
-            if day_open is not None and vwap is not None:
+            if day_open is not None and vwap is not None and symbol in top_wide_range_symbols:
+                latest_cvd = None
+                if level_reclaims or level_breakdowns:
+                    cvd_candles = get_today_candles(symbol, c["instrument_key"], token)
+                    if not cvd_candles.empty:
+                        latest_cvd = compute_cumulative_volume_delta(cvd_candles).iloc[-1]
+
                 for z in level_reclaims:  # bullish: broken level now acts as support
                     if not crossed_up:
                         continue
+                    if latest_cvd is None or latest_cvd <= 0:
+                        continue  # need net BUYING pressure to confirm a long
                     risk = predict_break_probability(
                         z, ltp=ltp, vwap=vwap, day_open=day_open,
                         session_start_time=MARKET_OPEN_TIME, session_end_time=MARKET_CLOSE_TIME,
@@ -1121,6 +1165,8 @@ def run_live_scan(cache, token):
                 for z in level_breakdowns:  # bearish: broken level now acts as resistance
                     if not crossed_down:
                         continue
+                    if latest_cvd is None or latest_cvd >= 0:
+                        continue  # need net SELLING pressure to confirm a short
                     risk = predict_break_probability(
                         z, ltp=ltp, vwap=vwap, day_open=day_open,
                         session_start_time=MARKET_OPEN_TIME, session_end_time=MARKET_CLOSE_TIME,
