@@ -621,6 +621,54 @@ def fetch_batch_quotes(instrument_keys, token):
     return resp.json().get("data", {})
 
 
+def build_manual_trade_candidate(direction, symbol, val_comp, chart_df):
+    """Same structure-based logic as the algo's entries -- stop is the
+    nearest zone against the trade, target is the nearest zone with it
+    -- just triggered by a manual Buy/Sell click on the Chart tab
+    instead of an automatic level-cross + VWAP-cross detection.
+
+    Only requires a STOP-side zone (support for a long, resistance for
+    a short) -- a trade can't be opened without a defined risk control.
+    The TARGET side is optional: if there's no zone on that side yet,
+    target is left as None (open-ended -- exits only via stop-loss or
+    end-of-day, same as the app already handles elsewhere), rather than
+    blocking the trade entirely just because profit-taking isn't
+    pinned to a level yet."""
+    if chart_df is None or chart_df.empty:
+        return None
+    day_open = float(chart_df["open"].iloc[0])
+    ltp = float(chart_df["close"].iloc[-1])
+    typical = (chart_df["high"] + chart_df["low"] + chart_df["close"]) / 3.0
+    cum_vol = chart_df["volume"].cumsum()
+    vwap_series = (typical * chart_df["volume"]).cumsum() / cum_vol.replace(0, pd.NA)
+    vwap = float(vwap_series.ffill().iloc[-1]) if cum_vol.iloc[-1] > 0 else None
+
+    support, _, resistance, _ = nearest_zones(ltp, val_comp)
+    if direction == "long":
+        stop_zone, target_zone = support, resistance
+    else:
+        stop_zone, target_zone = resistance, support
+    if stop_zone is None:
+        return None
+
+    risk = None
+    if vwap is not None:
+        risk = predict_break_probability(
+            stop_zone, ltp=ltp, vwap=vwap, day_open=day_open,
+            session_start_time=MARKET_OPEN_TIME, session_end_time=MARKET_CLOSE_TIME,
+            now_time=now_ist().time(), is_intraday_validated=True,  # stop_zone comes from val_comp, so it's validated by definition
+        )
+
+    return {
+        "symbol": symbol, "direction": direction, "entry_price": ltp,
+        "stop_loss": stop_zone["price_mode"],
+        "target": target_zone["price_mode"] if target_zone is not None else None,
+        "ml_risk_pct": round(risk * 100, 1) if risk is not None else None,
+        "zone_pct": _pct_from_label_safe(stop_zone["label"]),
+        "source": "manual",
+    }
+
+
 def nearest_zones(ltp, validated_zones):
     """Splits validated zones into support-side (price_mode <= ltp) and
     resistance-side (price_mode > ltp), and returns whichever of each is
@@ -773,20 +821,24 @@ def has_open_paper_trade(paper_log, symbol):
 
 def open_paper_trade(paper_log, candidate):
     """candidate: {symbol, direction, entry_price, stop_loss, target,
-    ml_risk_pct, zone_pct}. Skips if the position would round to 0
-    shares at the fixed rupee size (e.g. a very expensive stock)."""
+    ml_risk_pct, zone_pct, source}. source is "algo" (level-cross +
+    VWAP-cross + ML filter, opened automatically) or "manual" (opened by
+    clicking Buy/Sell on a chart). Skips if the position would round to
+    0 shares at the fixed rupee size (e.g. a very expensive stock)."""
     qty = int(PAPER_TRADE_SIZE_RUPEES // candidate["entry_price"])
     if qty < 1:
-        return
+        return False
     paper_log["trades"].append({
         "symbol": candidate["symbol"], "direction": candidate["direction"],
         "entry_price": candidate["entry_price"],
         "entry_time": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
         "stop_loss": candidate["stop_loss"], "target": candidate["target"], "qty": qty,
         "ml_risk_pct": candidate["ml_risk_pct"], "zone_pct": candidate["zone_pct"],
+        "source": candidate.get("source", "algo"),
         "status": "open", "exit_price": None, "exit_time": None,
         "exit_reason": None, "pnl": None,
     })
+    return True
 
 
 def check_paper_trade_exits(paper_log, price_lookup, force_eod=False):
@@ -884,16 +936,19 @@ def build_paper_trades_df(trades, status_filter):
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
+    if "source" not in df.columns:
+        df["source"] = "algo"
+    df["source"] = df["source"].fillna("algo")
     if status_filter == "open":
         df = df[["symbol", "direction", "entry_price", "stop_loss", "target",
-                  "qty", "ml_risk_pct", "zone_pct", "entry_time"]]
+                  "qty", "ml_risk_pct", "zone_pct", "source", "entry_time"]]
         df.columns = ["Symbol", "Direction", "Entry", "Stop", "Target",
-                      "Qty", "ML Risk %", "Zone %", "Entry Time"]
+                      "Qty", "ML Risk %", "Zone %", "Source", "Entry Time"]
     else:
         df = df[["symbol", "direction", "entry_price", "exit_price", "qty",
-                  "pnl", "exit_reason", "entry_time", "exit_time"]]
+                  "pnl", "exit_reason", "source", "entry_time", "exit_time"]]
         df.columns = ["Symbol", "Direction", "Entry", "Exit", "Qty",
-                      "P&L (\u20b9)", "Exit Reason", "Entry Time", "Exit Time"]
+                      "P&L (\u20b9)", "Exit Reason", "Source", "Entry Time", "Exit Time"]
         df = df.sort_values("Exit Time", ascending=False).reset_index(drop=True)
     return df
 
@@ -1570,6 +1625,62 @@ if os.path.exists(CACHE_PATH):
                     st.write("Not enough data to compute ML risk right now.")
                 else:
                     st.dataframe(ml_df, use_container_width=True, hide_index=True)
+
+                st.markdown("**Manual paper trade**")
+                st.caption(
+                    "One-click SIMULATED entry using the same structure-based logic as the "
+                    "automatic trades -- stop is the nearest zone against you, target is the "
+                    "nearest zone with you. Needs a stop-side zone to open at all (no trade "
+                    "without a defined risk control); target is left open if there's no zone "
+                    "on that side yet -- exits via stop-loss or end-of-day instead."
+                )
+                long_candidate = build_manual_trade_candidate("long", chart_symbol, val_comp, chart_df)
+                short_candidate = build_manual_trade_candidate("short", chart_symbol, val_comp, chart_df)
+
+                col_buy, col_sell = st.columns(2)
+                with col_buy:
+                    if long_candidate is None:
+                        st.write("Buy: no validated support to use as a stop-loss.")
+                    else:
+                        target_str = f"{long_candidate['target']:.2f}" if long_candidate['target'] is not None else "open (no resistance yet)"
+                        st.write(f"Buy @ {long_candidate['entry_price']:.2f} | "
+                                 f"Stop {long_candidate['stop_loss']:.2f} | "
+                                 f"Target {target_str}"
+                                 + (f" | ML Risk {long_candidate['ml_risk_pct']:.1f}%" if long_candidate['ml_risk_pct'] is not None else ""))
+                        if st.button("Buy (Long)", key="manual_buy_btn"):
+                            manual_paper_log = load_paper_trades()
+                            if has_open_paper_trade(manual_paper_log, chart_symbol):
+                                st.warning(f"Already have an open position in {chart_symbol}.")
+                            else:
+                                opened = open_paper_trade(manual_paper_log, long_candidate)
+                                if opened:
+                                    save_paper_trades(manual_paper_log)
+                                    st.session_state["paper_log"] = manual_paper_log
+                                    st.success(f"Opened manual LONG on {chart_symbol}.")
+                                else:
+                                    st.warning("Position size rounds to 0 shares at this price -- not opened.")
+
+                with col_sell:
+                    if short_candidate is None:
+                        st.write("Sell: no validated resistance to use as a stop-loss.")
+                    else:
+                        target_str = f"{short_candidate['target']:.2f}" if short_candidate['target'] is not None else "open (no support yet)"
+                        st.write(f"Sell @ {short_candidate['entry_price']:.2f} | "
+                                 f"Stop {short_candidate['stop_loss']:.2f} | "
+                                 f"Target {target_str}"
+                                 + (f" | ML Risk {short_candidate['ml_risk_pct']:.1f}%" if short_candidate['ml_risk_pct'] is not None else ""))
+                        if st.button("Sell (Short)", key="manual_sell_btn"):
+                            manual_paper_log = load_paper_trades()
+                            if has_open_paper_trade(manual_paper_log, chart_symbol):
+                                st.warning(f"Already have an open position in {chart_symbol}.")
+                            else:
+                                opened = open_paper_trade(manual_paper_log, short_candidate)
+                                if opened:
+                                    save_paper_trades(manual_paper_log)
+                                    st.session_state["paper_log"] = manual_paper_log
+                                    st.success(f"Opened manual SHORT on {chart_symbol}.")
+                                else:
+                                    st.warning("Position size rounds to 0 shares at this price -- not opened.")
 
     with tab_sectors:
         st.caption(
