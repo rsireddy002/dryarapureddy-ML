@@ -60,7 +60,7 @@ from streamlit_autorefresh import st_autorefresh
 from hvn_lvn import build_volume_profile, find_hvn_lvn
 from sahi_style_key_levels import sahi_style_key_levels
 from zone_validation import cross_validated_zones, compute_zone_signal
-from candles_with_levels import plot_candles_with_zones
+from candles_with_levels import plot_candles_with_zones, build_cvd_chart
 from ml_predict import predict_break_probability
 from live_feed_reader import get_live_candles
 
@@ -1612,6 +1612,14 @@ if os.path.exists(CACHE_PATH):
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
+                cvd_fig = build_cvd_chart(chart_df, height=140, x_range=get_session_x_range(chart_df))
+                st.plotly_chart(cvd_fig, use_container_width=True, key=f"cvd_chart_{chart_symbol}")
+                st.caption(
+                    "Cumulative volume delta -- an APPROXIMATION from candle color (up-close "
+                    "candle = buying volume, down-close = selling volume), since Upstox's candle "
+                    "API doesn't provide actual bid/ask tick data. Not tick-accurate order flow."
+                )
+
                 st.markdown("**ML break-risk per zone**")
                 st.caption(
                     "A confidence FILTER on top of the zones above, not a replacement -- "
@@ -1740,6 +1748,9 @@ if os.path.exists(CACHE_PATH):
                                 ml_risk_lookup=ml_lookup,
                             )
                             st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_chart_{sym}")
+
+                            cvd_fig = build_cvd_chart(grid_df, height=80, compact=True, x_range=get_session_x_range(grid_df))
+                            st.plotly_chart(cvd_fig, use_container_width=True, key=f"{key_prefix}_cvd_{sym}")
 
                             long_c = build_manual_trade_candidate("long", sym, val_comp, grid_df)
                             short_c = build_manual_trade_candidate("short", sym, val_comp, grid_df)
