@@ -220,6 +220,16 @@ def compute_composite_zones(intraday_df):
         return []
 
 
+def compute_ema_200(closes, period=200):
+    """Latest 200-period EMA from a 5-min closing-price series -- see
+    app.py's identical function for the full reasoning (computed once
+    per Precompute from 18 days of composite history, held static
+    through the day rather than recomputed live each cycle)."""
+    if len(closes) < period:
+        return None
+    return float(pd.Series(closes).ewm(span=period, adjust=False).mean().iloc[-1])
+
+
 def compute_intraday_zones(today_only_df):
     if today_only_df.empty:
         return []
@@ -413,10 +423,12 @@ def run_precompute(token):
                                  if len(daily_df) >= RVOL_BASELINE_DAYS else None)
             composite_zones = compute_composite_zones(intraday_df)
             intraday_zones = compute_intraday_zones(intraday_df)
+            ema_200 = compute_ema_200(intraday_df["close"].tolist()) if not intraday_df.empty else None
             cache[symbol] = {
                 "instrument_key": key, "prev_close": prev_close,
                 "avg_daily_volume": avg_daily_volume,
                 "composite_zones": composite_zones, "intraday_zones": intraday_zones,
+                "ema_200": ema_200,
                 "zones_updated_at": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
                 "prev_ltp": None, "prev_vwap_above": None,
             }
@@ -531,6 +543,25 @@ def run_scan_cycle(cache, token, paper_log):
         prev_ltp = c.get("prev_ltp")
         level_breakdowns, level_reclaims = crossed_zones(prev_ltp, ltp, val_comp)
         cache[symbol]["prev_ltp"] = ltp
+
+        # 200-EMA CROSSING filter -- see app.py's identical logic for
+        # the full reasoning. Requires an actual crossing EVENT on this
+        # tick (price moving from one side of the EMA to the other),
+        # not just "currently on the right side" -- a stock that's
+        # simply been sitting above/below the EMA with no fresh cross
+        # right now does NOT count. Can't detect a crossing without a
+        # previous tick to compare against, or without a computed EMA
+        # -- both filter out entirely rather than assuming a pass.
+        ema_200 = c.get("ema_200")
+        if ema_200 is None or prev_ltp is None:
+            level_breakdowns, level_reclaims = [], []
+        else:
+            ema_crossed_up = prev_ltp <= ema_200 and ltp > ema_200
+            ema_crossed_down = prev_ltp >= ema_200 and ltp < ema_200
+            if not ema_crossed_up:
+                level_reclaims = []
+            if not ema_crossed_down:
+                level_breakdowns = []
 
         day_open = (q.get("ohlc") or {}).get("open") or prev_close
         if day_open is not None and vwap is not None and symbol in top_wide_range_symbols:

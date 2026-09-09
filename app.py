@@ -53,6 +53,7 @@ from datetime import datetime, timedelta, timezone, time as dtime
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
@@ -474,6 +475,26 @@ def compute_composite_zones(intraday_df):
         return []
 
 
+def compute_ema_200(closes, period=200):
+    """Latest 200-period EMA value from a 5-min closing-price series.
+    Needs at least `period` candles to be meaningful -- with 18 days of
+    composite 5-min history (~1,350 candles), there's comfortably
+    enough, but returns None defensively if there ever isn't (e.g. a
+    newly-listed stock without 18 days of history yet).
+
+    Computed ONCE per Precompute from the full composite series, then
+    held static through the day -- a 200-period EMA is inherently slow-
+    moving (smoothing over many days of data), so its value barely
+    shifts within a single session. Recomputing it live each cycle
+    would need the full multi-day candle series again (expensive,
+    defeats the whole point of the cheap batch-quotes design), so this
+    is a deliberate, honest tradeoff: accurate as of this morning's
+    Precompute, not continuously live through the day."""
+    if len(closes) < period:
+        return None
+    return float(pd.Series(closes).ewm(span=period, adjust=False).mean().iloc[-1])
+
+
 def compute_intraday_zones(today_only_df):
     """Intraday zone set from a candle df already scoped to a single
     session (see fetch_today_candles below)."""
@@ -571,6 +592,7 @@ def run_precompute(token, progress_callback=None):
                                  if len(daily_df) >= RVOL_BASELINE_DAYS else None)
             composite_zones = compute_composite_zones(intraday_df)
             intraday_zones = compute_intraday_zones(intraday_df)  # seed with today's slice of what we already have
+            ema_200 = compute_ema_200(intraday_df["close"].tolist()) if not intraday_df.empty else None
 
             cache[symbol] = {
                 "instrument_key": key,
@@ -578,6 +600,7 @@ def run_precompute(token, progress_callback=None):
                 "avg_daily_volume": avg_daily_volume,
                 "composite_zones": composite_zones,
                 "intraday_zones": intraday_zones,
+                "ema_200": ema_200,
                 "last_signal": "-",
                 "zones_updated_at": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
             }
@@ -945,6 +968,138 @@ def render_daemon_status():
             st.error(f"**{consecutive_errors} consecutive failures.** Last error: {last_error}")
 
 
+def build_journal_analytics(closed_trades):
+    """Computes hourly P&L/win-rate, long-vs-short, hold-time-by-outcome,
+    and repeat-offender patterns from whatever closed trades currently
+    exist -- recomputed fresh every time this is called (every page
+    load), so the Trade Journal tab always reflects the CURRENT state
+    of the log, not a frozen snapshot from whenever it was built."""
+    if not closed_trades:
+        return None
+    df = pd.DataFrame(closed_trades)
+    df["Entry Time"] = pd.to_datetime(df["entry_time"])
+    df["Exit Time"] = pd.to_datetime(df["exit_time"])
+    df["Hold Minutes"] = (df["Exit Time"] - df["Entry Time"]).dt.total_seconds() / 60
+    df["Win"] = df["pnl"] > 0
+    df["Entry Hour"] = df["Entry Time"].dt.hour
+
+    hourly = df.groupby("Entry Hour").agg(
+        trades=("pnl", "count"), pnl=("pnl", "sum"), win_rate=("Win", "mean")
+    ).reset_index().to_dict("records")
+
+    direction = df.groupby("direction").agg(
+        trades=("pnl", "count"), pnl=("pnl", "sum"), win_rate=("Win", "mean")
+    ).reset_index().to_dict("records")
+
+    hold_by_outcome = df.groupby("Win")["Hold Minutes"].median().to_dict()
+
+    symbol_counts = df["symbol"].value_counts()
+    repeats = symbol_counts[symbol_counts > 1]
+    repeat_data = []
+    for sym in repeats.index:
+        sub = df[df["symbol"] == sym]
+        repeat_data.append({
+            "symbol": sym, "trades": len(sub),
+            "wins": int(sub["Win"].sum()), "pnl": round(sub["pnl"].sum(), 2),
+        })
+    repeat_data.sort(key=lambda x: x["pnl"])
+
+    return {
+        "total_trades": len(df),
+        "total_pnl": round(df["pnl"].sum(), 2),
+        "win_rate": round(df["Win"].mean() * 100, 1),
+        "avg_win": round(df[df["Win"]]["pnl"].mean(), 2) if df["Win"].any() else None,
+        "avg_loss": round(df[~df["Win"]]["pnl"].mean(), 2) if (~df["Win"]).any() else None,
+        "hourly": hourly,
+        "direction": direction,
+        "hold_winners_median": round(hold_by_outcome.get(True, 0), 1),
+        "hold_losers_median": round(hold_by_outcome.get(False, 0), 1),
+        "repeat_offenders": repeat_data,
+    }
+
+
+def render_trade_journal(paper_log):
+    """Renders the Trade Journal tab -- a ledger-styled, always-current
+    review of every closed paper trade, recomputed fresh from whatever
+    is in paper_log right now."""
+    st.markdown("""
+        <style>
+        .journal-headline { font-size: 52px; font-weight: 600; font-family: 'Georgia', serif;
+            line-height: 1; margin-bottom: 4px; }
+        .journal-sub { color: #6b6b7a; font-size: 15px; margin-bottom: 20px; }
+        .journal-ledger-row { display: flex; justify-content: space-between; padding: 8px 0;
+            border-bottom: 1px solid rgba(0,0,0,0.08); font-size: 14px; }
+        </style>
+    """, unsafe_allow_html=True)
+
+    closed = [t for t in paper_log.get("trades", []) if t["status"] == "closed"]
+    analytics = build_journal_analytics(closed)
+
+    if analytics is None:
+        st.info("No closed trades yet -- the journal fills in as trades close.")
+        return
+
+    pnl_color = "#1B5E3F" if analytics["total_pnl"] >= 0 else "#8B2635"
+    sign = "+" if analytics["total_pnl"] >= 0 else "\u2212"
+    st.markdown(
+        f'<div class="journal-headline" style="color:{pnl_color}">{sign}\u20b9{abs(analytics["total_pnl"]):.0f}</div>'
+        f'<div class="journal-sub">net across {analytics["total_trades"]} closed trades</div>',
+        unsafe_allow_html=True,
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Win rate", f"{analytics['win_rate']:.0f}%")
+    col2.metric("Avg win", f"\u20b9{analytics['avg_win']:.0f}" if analytics["avg_win"] else "\u2014")
+    col3.metric("Avg loss", f"\u20b9{analytics['avg_loss']:.0f}" if analytics["avg_loss"] else "\u2014")
+    col4.metric("Trades", analytics["total_trades"])
+
+    st.markdown("**P&L by hour of entry**")
+    hourly_df = pd.DataFrame(analytics["hourly"])
+    hourly_df["Hour"] = hourly_df["Entry Hour"].apply(lambda h: f"{h}:00")
+    hourly_df["Color"] = hourly_df["pnl"].apply(lambda v: "Gain" if v >= 0 else "Loss")
+    hourly_fig = go.Figure()
+    hourly_fig.add_trace(go.Bar(
+        x=hourly_df["Hour"], y=hourly_df["pnl"],
+        marker_color=hourly_df["pnl"].apply(lambda v: "#1B5E3F" if v >= 0 else "#8B2635"),
+        text=hourly_df["win_rate"].apply(lambda w: f"{w*100:.0f}% WR"),
+        textposition="outside",
+    ))
+    hourly_fig.update_layout(
+        height=280, margin=dict(l=40, r=20, t=20, b=30),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        yaxis=dict(title="P&L (\u20b9)"), showlegend=False,
+    )
+    st.plotly_chart(hourly_fig, use_container_width=True)
+
+    st.markdown("**Long vs. short**")
+    dcol1, dcol2 = st.columns(2)
+    for d in analytics["direction"]:
+        target_col = dcol1 if d["direction"] == "long" else dcol2
+        color = "#1B5E3F" if d["pnl"] >= 0 else "#8B2635"
+        target_col.markdown(
+            f"**{d['direction'].capitalize()}**<br>"
+            f"<span style='color:{color}'>\u20b9{d['pnl']:.0f}</span> \u00b7 {d['win_rate']*100:.0f}% win rate "
+            f"({d['trades']} trades)",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("**Median hold time**")
+    hcol1, hcol2 = st.columns(2)
+    hcol1.markdown(f"Winners: **{analytics['hold_winners_median']:.0f} min**")
+    hcol2.markdown(f"Losers: **{analytics['hold_losers_median']:.0f} min**")
+
+    if analytics["repeat_offenders"]:
+        st.markdown("**Repeat names** (traded more than once)")
+        for r in analytics["repeat_offenders"]:
+            color = "#1B5E3F" if r["pnl"] >= 0 else "#8B2635"
+            st.markdown(
+                f'<div class="journal-ledger-row"><span>{r["symbol"]} '
+                f'<span style="color:#6b6b7a">({r["trades"]} trades, {r["wins"]} wins)</span></span>'
+                f'<span style="color:{color}">\u20b9{r["pnl"]:.0f}</span></div>',
+                unsafe_allow_html=True,
+            )
+
+
 def build_paper_trades_df(trades, status_filter):
     rows = [t for t in trades if t["status"] == status_filter]
     if not rows:
@@ -1087,6 +1242,31 @@ def run_live_scan(cache, token):
             prev_ltp = c.get("prev_ltp")
             level_breakdowns, level_reclaims = crossed_zones(prev_ltp, ltp, val_comp)
             cache[symbol]["prev_ltp"] = ltp
+
+            # 200-EMA CROSSING filter (5-min, computed at Precompute from
+            # the 18-day composite series -- see compute_ema_200 for why
+            # this is a once-a-day snapshot, not continuously live).
+            # This checks for an actual CROSSING EVENT on this exact
+            # tick, not just "currently on the right side" -- price must
+            # cross UP through the EMA on the same tick as a bullish
+            # level-cross to confirm it, and cross DOWN on the same tick
+            # for a bearish one. A stock that's simply been sitting
+            # above/below the EMA for a while (no fresh cross right now)
+            # does NOT count, matching the same "all conditions align on
+            # THIS tick" discipline already used for the VWAP-cross.
+            # Can't detect a crossing at all without a previous tick to
+            # compare against, or without a computed EMA -- both cases
+            # filter out entirely rather than assuming a pass.
+            ema_200 = c.get("ema_200")
+            if ema_200 is None or prev_ltp is None:
+                level_breakdowns, level_reclaims = [], []
+            else:
+                ema_crossed_up = prev_ltp <= ema_200 and ltp > ema_200
+                ema_crossed_down = prev_ltp >= ema_200 and ltp < ema_200
+                if not ema_crossed_up:
+                    level_reclaims = []
+                if not ema_crossed_down:
+                    level_breakdowns = []
 
             for z in level_breakdowns:
                 # after breaking down through this level, the nearest
@@ -1537,9 +1717,17 @@ if os.path.exists(CACHE_PATH):
 
     st.divider()
 
-    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_range, tab_setups, tab_paper, tab_replay, tab_alerts = st.tabs(
-        ["Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Wide Range", "Setups", "Paper Trading", "Replay", "Alerts"]
+    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_rvol, tab_range, tab_setups, tab_paper, tab_journal, tab_replay, tab_alerts = st.tabs(
+        ["Scanner", "Key Levels", "Chart", "Sectors", "By RVOL", "Wide Range", "Setups", "Paper Trading", "Trade Journal", "Replay", "Alerts"]
     )
+
+    with tab_journal:
+        st.caption(
+            "A ledger-style review of every closed paper trade -- recomputed fresh every time "
+            "you open this tab, so it always reflects the current state of the log, whether "
+            "that's today's trades or several days' worth."
+        )
+        render_trade_journal(st.session_state.get("paper_log") or load_paper_trades())
 
     with tab_paper:
         st.warning(
@@ -1655,6 +1843,7 @@ if os.path.exists(CACHE_PATH):
                     title=chart_title,
                     x_range=get_session_x_range(chart_df),
                     ml_risk_lookup=ml_lookup,
+                    ema_200=c.get("ema_200"),
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -1792,6 +1981,7 @@ if os.path.exists(CACHE_PATH):
                                 compact=True,
                                 x_range=get_session_x_range(grid_df),
                                 ml_risk_lookup=ml_lookup,
+                                ema_200=c.get("ema_200"),
                             )
                             st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_chart_{sym}")
 

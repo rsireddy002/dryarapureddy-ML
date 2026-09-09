@@ -81,7 +81,7 @@ def plot_candles_with_zones(df, composite_zones=None, intraday_zones=None,
                              validated_zones=None, title="Price with key levels",
                              show_vwap=True, x_range=None, height=500, compact=False,
                              tick_format=None, y_range=None, market_hours_breaks=False,
-                             event_markers=None, ml_risk_lookup=None):
+                             event_markers=None, ml_risk_lookup=None, ema_200=None):
     """
     df: OHLC(V) dataframe with columns ['timestamp','open','high','low','close']
         and ideally 'volume' (needed for the VWAP line).
@@ -130,6 +130,14 @@ def plot_candles_with_zones(df, composite_zones=None, intraday_zones=None,
         is appended directly to that zone's on-chart label (e.g.
         "Support 893 (19%) - ML 4%"), so the risk is visible right on
         the line itself, not just in a separate table.
+    ema_200: optional float -- the 200-period EMA on 5-min candles,
+        computed once at Precompute from 18 days of composite history
+        (see compute_ema_200). Drawn as a single horizontal reference
+        line rather than a true curve: a 200-period EMA is inherently
+        slow-moving, and recomputing a full live curve would need the
+        entire multi-day candle series again on every render. None
+        means not enough history yet (e.g. a newly-listed stock) --
+        simply omits the line rather than guessing.
     """
     fig = go.Figure()
 
@@ -158,6 +166,13 @@ def plot_candles_with_zones(df, composite_zones=None, intraday_zones=None,
         x0, x1 = x_range
     else:
         x0, x1 = df["timestamp"].iloc[0], df["timestamp"].iloc[-1]
+
+    if ema_200 is not None:
+        fig.add_trace(go.Scatter(
+            x=[x0, x1], y=[ema_200, ema_200],
+            mode="lines", name="EMA 200",
+            line=dict(color="#B983FF", width=1.5, dash="dot"),
+        ))
     last_close = float(df["close"].iloc[-1])
 
     composite_zones = composite_zones or []
